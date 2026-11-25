@@ -83,16 +83,49 @@ def chain_metric_query(metric_id: int) -> dict[str, Any]:
 @router.get("/experiment-evaluate/{experiment_id}")
 def chain_experiment_evaluate(experiment_id: int) -> dict[str, Any]:
     """实验→显著性检验→采样的AB实验评估链路。"""
+    from app.allocation import (
+        CONTROL, TREATMENT, GROUP_LABELS, allocation_registry, parse_split_ratio,
+        plan_group_quotas,
+    )
+
     exp = store.find("experiment", experiment_id)
     if not exp:
         raise HTTPException(404, f"实验方案 {experiment_id} 不存在")
 
-    # Step 1: 模拟对照组和实验组数据
+    # Step 1: 分组人数按样本分配批次的实际口径计算，与实验效果入口共用同一规则
     rng = random.Random(experiment_id * 7 + 13)
-    n_control = int(str(exp.get("样本比例", "50")).replace("%", "").strip() or 50) if str(exp.get("样本比例", "50")).isdigit() else 50
-    n_experiment = 100 - n_control
-    control_data = [rng.gauss(100, 15) for _ in range(max(5, n_control))]
-    experiment_data = [rng.gauss(102, 15) for _ in range(max(5, n_experiment))]
+    batches = allocation_registry.batches(experiment_id)
+    if batches:
+        snapshot = allocation_registry.snapshot(experiment_id)
+        totals = snapshot["totals"]
+        quota = totals["quota"]
+        group_counts = totals["group_counts"]
+        # 有实际曝光用实际分组数量，全部批次尚无曝光时回退到计划名额
+        if totals["unique_exposures"] > 0:
+            n_control, n_experiment = group_counts[CONTROL], group_counts[TREATMENT]
+        else:
+            n_control, n_experiment = quota[CONTROL], quota[TREATMENT]
+        allocation_batches = snapshot["batches"]
+    else:
+        ratio = parse_split_ratio(exp.get("样本比例"))
+        quota = plan_group_quotas(100, ratio)
+        n_control, n_experiment = quota[CONTROL], quota[TREATMENT]
+        group_counts = {CONTROL: 0, TREATMENT: 0}
+        plan = allocation_registry.plan_snapshot(
+            experiment_id, exp.get("样本比例"), 100
+        )
+        allocation_batches = [{
+            "batch_no": 0,
+            "status": "planned",
+            "control_ratio": ratio,
+            "planned_exposures": 100,
+            "quota": quota,
+            "group_counts": group_counts,
+            "exposure_range": {"min_seq": 0, "max_seq": 0, "count": 0},
+            "split_condition": plan["split_condition"],
+        }]
+    control_data = [rng.gauss(100, 15) for _ in range(n_control)]
+    experiment_data = [rng.gauss(102, 15) for _ in range(n_experiment)]
 
     # Step 2: 执行显著性检验
     sig_tasks = [row for row in store.rows("significance")
@@ -105,14 +138,16 @@ def chain_experiment_evaluate(experiment_id: int) -> dict[str, Any]:
         except (ValueError, TypeError):
             confidence = 0.95
         alpha = 1 - confidence
+        safe_control = control_data or [0.0, 0.0]
+        safe_experiment = experiment_data or [0.0, 0.0]
         if "chi" in str(method).lower() or "卡方" in str(method):
             result = chi_square_test(
-                [sum(control_data) / len(control_data), sum(experiment_data) / len(experiment_data)],
-                [sum(control_data) / len(control_data)] * 2,
+                [sum(safe_control) / len(safe_control), sum(safe_experiment) / len(safe_experiment)],
+                [sum(safe_control) / len(safe_control)] * 2,
                 alpha=alpha
             )
         else:
-            result = t_test(control_data, experiment_data, alpha=alpha)
+            result = t_test(safe_control, safe_experiment, alpha=alpha)
         significance_results.append({
             "task_id": task.get("id"),
             "task_name": task.get("任务标识"),
@@ -153,6 +188,13 @@ def chain_experiment_evaluate(experiment_id: int) -> dict[str, Any]:
         "chain": "AB实验评估链路",
         "experiment": {"id": experiment_id, "name": exp.get("实验名称"),
                        "control_group": exp.get("对照组"), "experiment_group": exp.get("实验组")},
+        "allocation": {
+            "recorded_ratio": parse_split_ratio(exp.get("样本比例")),
+            "quota": quota,
+            "group_counts": group_counts,
+            "group_labels": GROUP_LABELS,
+            "batches": allocation_batches,
+        },
         "descriptive_stats": {
             "control": {"n": len(control_data), "mean": round(sum(control_data) / len(control_data), 4) if control_data else 0},
             "experiment": {"n": len(experiment_data), "mean": round(sum(experiment_data) / len(experiment_data), 4) if experiment_data else 0},

@@ -29,3 +29,21 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class AllocationPlanPayload(BaseModel):
+    """初始化样本分配批次：分流比例 + 计划曝光数。"""
+    split_ratio: Any
+    planned_exposures: int = Field(default=100, ge=1)
+
+
+class ExposureReportPayload(BaseModel):
+    """曝光上报：曝光编号必填；同编号重复上报幂等。"""
+    exposure_no: str
+    planned_exposures: int = Field(default=100, ge=1)
+
+
+class RatioChangePayload(BaseModel):
+    """修改分流比例：旧批次封存，按新口径开启新批次。"""
+    split_ratio: Any
+    planned_exposures: int | None = Field(default=None, ge=1)

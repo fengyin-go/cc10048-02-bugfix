@@ -5,6 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+from app.schemas import AllocationPlanPayload, ExposureReportPayload, RatioChangePayload
 from app.services import SERVICES
 
 router = APIRouter(prefix="/api/domain", tags=["领域业务"])
@@ -31,13 +32,78 @@ def dim_query_execute(query_id: int) -> dict[str, Any]:
 
 
 @router.get("/experiment/{experiment_id}/compute-effect")
-def experiment_compute(experiment_id: int) -> dict[str, Any]:
-    """实验效果计算。"""
+def experiment_compute(experiment_id: int, planned_exposures: int = 100) -> dict[str, Any]:
+    """实验效果计算：分组人数与名额上限来自样本分配批次的实际口径。"""
     from app.services.experiment import ExperimentService
     svc = SERVICES.get("experiment")
     if not svc or not isinstance(svc, ExperimentService):
         raise HTTPException(404, "实验管理服务不可用")
-    return svc.compute_effect(experiment_id)
+    return svc.compute_effect(experiment_id, planned_exposures=planned_exposures)
+
+
+@router.post("/experiment/{experiment_id}/allocation")
+def experiment_allocation_plan(experiment_id: int, payload: AllocationPlanPayload) -> dict[str, Any]:
+    """按录入的分流比例和计划曝光数初始化/获取当前分配批次。
+
+    「30%」与「0.30」走同一解析规则，100 次计划曝光均得到 30 个对照名额、
+    70 个实验名额。
+    """
+    from app.allocation import AllocationError
+    from app.services.experiment import ExperimentService
+    svc = SERVICES.get("experiment")
+    if not svc or not isinstance(svc, ExperimentService):
+        raise HTTPException(404, "实验管理服务不可用")
+    try:
+        return svc.init_allocation(experiment_id, payload.split_ratio, payload.planned_exposures)
+    except AllocationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/experiment/{experiment_id}/allocation")
+def experiment_allocation_snapshot(experiment_id: int) -> dict[str, Any]:
+    """回查分配批次：每轮口径、名额上限、分组计数与实际曝光范围。"""
+    from app.services.experiment import ExperimentService
+    svc = SERVICES.get("experiment")
+    if not svc or not isinstance(svc, ExperimentService):
+        raise HTTPException(404, "实验管理服务不可用")
+    try:
+        return svc.allocation_snapshot(experiment_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/experiment/{experiment_id}/exposures")
+def experiment_report_exposure(experiment_id: int, payload: ExposureReportPayload) -> dict[str, Any]:
+    """上报一次曝光并占用一个名额；同一曝光编号重复上报只占一个名额。"""
+    from app.allocation import AllocationError
+    from app.services.experiment import ExperimentService
+    svc = SERVICES.get("experiment")
+    if not svc or not isinstance(svc, ExperimentService):
+        raise HTTPException(404, "实验管理服务不可用")
+    try:
+        return svc.report_exposure(experiment_id, payload.exposure_no, payload.planned_exposures)
+    except AllocationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/experiment/{experiment_id}/ratio")
+def experiment_change_ratio(experiment_id: int, payload: RatioChangePayload) -> dict[str, Any]:
+    """修改分流比例：封存旧批次并开启新批次，历史曝光不按新比例重新计数。"""
+    from app.allocation import AllocationError
+    from app.services.experiment import ExperimentService
+    svc = SERVICES.get("experiment")
+    if not svc or not isinstance(svc, ExperimentService):
+        raise HTTPException(404, "实验管理服务不可用")
+    try:
+        return svc.change_split_ratio(experiment_id, payload.split_ratio, payload.planned_exposures)
+    except AllocationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @router.get("/significance/{task_id}/run-test")
